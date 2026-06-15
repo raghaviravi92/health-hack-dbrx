@@ -1,5 +1,5 @@
 bundle:
-  name: content-moderator
+  name: data-readiness-desk
 
 variables:
   sql_warehouse_id:
@@ -14,8 +14,8 @@ variables:
 resources:
   apps:
     app:
-      name: "content-moderator"
-      description: "Internal content moderation tool with AI-powered compliance scoring"
+      name: "data-readiness-desk"
+      description: "Facility data readiness review desk with Lakebase-backed anomaly triage"
       source_code_path: ./
       user_api_scopes:
         - dashboards.genie
@@ -39,10 +39,10 @@ targets:
   default:
     default: true
     workspace:
-      host: REPLACE_ME # e.g. https://my-workspace.cloud.databricks.com
+      host: https://dbc-5dc5c12d-0613.cloud.databricks.com
 
     variables:
-      sql_warehouse_id: REPLACE_ME
-      genie_space_id: REPLACE_ME
-      postgres_branch: REPLACE_ME # e.g. projects/my-project/branches/production
-      postgres_database: REPLACE_ME # e.g. projects/my-project/branches/production/databases/my-db
+      sql_warehouse_id: cd93d052cd252765
+      genie_space_id: 01f168da6aac14dc917de63ed8a42bf9
+      postgres_branch: projects/slrp-lakebase/branches/production
+      postgres_database: projects/slrp-lakebase/branches/production/databases/databricks-postgres

@@ -32,6 +32,15 @@ export function timeAgo(dateStr: string): string {
     : `${days}d ago`;
 }
 
+export const READINESS_FIELDS = [
+  { value: "zip", label: "Zip Codes" },
+  { value: "coords", label: "Coordinates" },
+  { value: "state", label: "State Names" },
+  { value: "email", label: "Emails" },
+  { value: "phone", label: "Phones" },
+  { value: "district", label: "Districts" },
+] as const;
+
 export const CONTENT_TARGETS = [
   { value: "blog", label: "Company Blog" },
   { value: "linkedin", label: "LinkedIn" },
@@ -40,6 +49,14 @@ export const CONTENT_TARGETS = [
   { value: "press_release", label: "Press Release" },
 ] as const;
 
+export function fieldLabel(fieldName: string): string {
+  return READINESS_FIELDS.find((f) => f.value === fieldName)?.label ?? fieldName;
+}
+
 export function targetLabel(target: string): string {
-  return CONTENT_TARGETS.find((t) => t.value === target)?.label ?? target;
+  return (
+    READINESS_FIELDS.find((f) => f.value === target)?.label ??
+    CONTENT_TARGETS.find((t) => t.value === target)?.label ??
+    target
+  );
 }

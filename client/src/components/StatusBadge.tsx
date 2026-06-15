@@ -4,10 +4,12 @@ const STATUS_VARIANTS: Record<
   string,
   "default" | "secondary" | "destructive" | "outline"
 > = {
-  pending_review: "secondary",
-  approved: "default",
+  pending: "secondary",
+  resolved: "default",
   rejected: "destructive",
-  revision_requested: "outline",
+  nullified: "outline",
+  reopened: "secondary",
+  stale: "outline",
 };
 
 export function StatusBadge({ status }: { status: string }) {

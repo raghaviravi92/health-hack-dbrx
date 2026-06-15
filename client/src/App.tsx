@@ -1,13 +1,14 @@
 import {
   createBrowserRouter,
+  Navigate,
   RouterProvider,
   NavLink,
   Outlet,
 } from "react-router";
-import { SubmissionsPage } from "./pages/SubmissionsPage";
-import { SubmitContentPage } from "./pages/SubmitContentPage";
-import { SubmissionDetailPage } from "./pages/SubmissionDetailPage";
-import { GuidelinesPage } from "./pages/GuidelinesPage";
+import { ReadinessDashboardPage } from "./pages/ReadinessDashboardPage";
+import { QueueReviewPage } from "./pages/QueueReviewPage";
+import { ShortlistPage } from "./pages/ShortlistPage";
+import { ScenariosPage } from "./pages/ScenariosPage";
 import { AnalyticsPage } from "./pages/AnalyticsPage";
 
 const navLinkClass = ({ isActive }: { isActive: boolean }) =>
@@ -23,17 +24,17 @@ function Layout() {
       <header className="border-b border-border/50 px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-6">
           <h1 className="text-base font-semibold tracking-tight text-foreground">
-            Content Moderator
+            Data Readiness Desk
           </h1>
           <nav className="flex gap-1">
             <NavLink to="/" end className={navLinkClass}>
-              Review Queue
+              Dashboard
             </NavLink>
-            <NavLink to="/submit" className={navLinkClass}>
-              Submit
+            <NavLink to="/indicators" className={navLinkClass}>
+              Indicator Review
             </NavLink>
-            <NavLink to="/guidelines" className={navLinkClass}>
-              Guidelines
+            <NavLink to="/scenarios" className={navLinkClass}>
+              Scenarios
             </NavLink>
             <NavLink to="/analytics" className={navLinkClass}>
               Analytics
@@ -41,7 +42,7 @@ function Layout() {
           </nav>
         </div>
         <span className="text-xs text-muted-foreground uppercase tracking-widest">
-          Content Ops
+          Data Ops
         </span>
       </header>
 
@@ -56,11 +57,13 @@ const router = createBrowserRouter([
   {
     element: <Layout />,
     children: [
-      { path: "/", element: <SubmissionsPage /> },
-      { path: "/submit", element: <SubmitContentPage /> },
-      { path: "/submissions/:id", element: <SubmissionDetailPage /> },
-      { path: "/guidelines", element: <GuidelinesPage /> },
+      { path: "/", element: <ReadinessDashboardPage /> },
+      { path: "/queue/:fieldName", element: <QueueReviewPage /> },
+      { path: "/shortlist", element: <Navigate to="/indicators" replace /> },
+      { path: "/indicators", element: <ShortlistPage /> },
+      { path: "/scenarios", element: <ScenariosPage /> },
       { path: "/analytics", element: <AnalyticsPage /> },
+      { path: "*", element: <Navigate to="/" replace /> },
     ],
   },
 ]);

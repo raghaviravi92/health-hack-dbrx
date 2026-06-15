@@ -1,15 +1,36 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
-  useAnalyticsQuery,
-  BarChart,
   GenieChat,
   Card,
   CardContent,
   CardHeader,
   CardTitle,
 } from "@databricks/appkit-ui/react";
+import { fieldLabel } from "../lib/utils";
 
 type Tab = "dashboard" | "genie";
+
+interface SummaryTotals {
+  total?: number | string;
+  pending?: number | string;
+  resolved?: number | string;
+  rejected?: number | string;
+  nullified?: number | string;
+  reopened?: number | string;
+  stale?: number | string;
+}
+
+interface QueueSummary {
+  field_name: string;
+  total: number | string;
+  remaining: number | string;
+  resolved: number | string;
+}
+
+interface SummaryResponse {
+  totals: SummaryTotals;
+  queues: QueueSummary[];
+}
 
 const tabClass = (active: boolean) =>
   `px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
@@ -45,72 +66,122 @@ function SummaryCard({
   );
 }
 
-function DashboardTab() {
-  const { data: overview, loading: overviewLoading } = useAnalyticsQuery(
-    "content_overview",
-    {},
+function numberValue(value: number | string | undefined): number {
+  return Number(value ?? 0);
+}
+
+function QueueBars({
+  title,
+  queues,
+  valueKey,
+}: {
+  title: string;
+  queues: QueueSummary[];
+  valueKey: "remaining" | "resolved";
+}) {
+  const max = Math.max(1, ...queues.map((queue) => numberValue(queue[valueKey])));
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-sm">{title}</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3">
+        {queues.length === 0 && (
+          <p className="text-sm text-muted-foreground py-8 text-center">
+            No anomaly data yet.
+          </p>
+        )}
+        {queues.map((queue) => {
+          const value = numberValue(queue[valueKey]);
+          return (
+            <div key={queue.field_name} className="space-y-1.5">
+              <div className="flex items-center justify-between gap-3 text-sm">
+                <span>{fieldLabel(queue.field_name)}</span>
+                <span className="font-mono">{value}</span>
+              </div>
+              <div className="h-2 rounded bg-muted/40 overflow-hidden">
+                <div
+                  className="h-full bg-foreground/80"
+                  style={{ width: `${Math.max(4, (value / max) * 100)}%` }}
+                />
+              </div>
+            </div>
+          );
+        })}
+      </CardContent>
+    </Card>
   );
-  const latest = overview && overview.length > 0 ? overview[0] : null;
+}
+
+function DashboardTab() {
+  const [summary, setSummary] = useState<SummaryResponse | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetch("/api/readiness/summary")
+      .then((res) => {
+        if (!res.ok) throw new Error("Failed to load analytics summary");
+        return res.json() as Promise<SummaryResponse>;
+      })
+      .then(setSummary)
+      .catch((err) =>
+        setError(err instanceof Error ? err.message : "Failed to load summary"),
+      )
+      .finally(() => setLoading(false));
+  }, []);
+
+  const totals = summary?.totals ?? {};
+  const reviewed =
+    numberValue(totals.resolved) +
+    numberValue(totals.rejected) +
+    numberValue(totals.nullified);
+  const total = numberValue(totals.total);
+  const resolutionRate = total > 0 ? Math.round((reviewed / total) * 100) : 0;
 
   return (
     <div className="space-y-8">
+      {error && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">
+          {error}
+        </div>
+      )}
+
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <SummaryCard
-          label="Total Submissions"
-          value={latest ? Number(latest.total_submissions) : 0}
-          loading={overviewLoading}
+          label="Total Anomalies"
+          value={total}
+          loading={loading}
         />
         <SummaryCard
-          label="Pending Review"
-          value={latest ? Number(latest.pending_count) : 0}
-          loading={overviewLoading}
+          label="Remaining"
+          value={numberValue(totals.pending) + numberValue(totals.reopened)}
+          loading={loading}
         />
         <SummaryCard
-          label="Approved"
-          value={latest ? Number(latest.approved_count) : 0}
-          loading={overviewLoading}
+          label="Resolved"
+          value={numberValue(totals.resolved)}
+          loading={loading}
         />
         <SummaryCard
-          label="Avg AI Score"
-          value={latest ? Number(latest.avg_compliance_score) : 0}
-          loading={overviewLoading}
+          label="Resolution Rate"
+          value={`${resolutionRate}%`}
+          loading={loading}
         />
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm">Submissions by Target</CardTitle>
-          </CardHeader>
-          <CardContent>
-            <BarChart
-              queryKey="submissions_by_target"
-              parameters={{}}
-              xKey="target"
-              yKey="submission_count"
-              height={300}
-              colors={["oklch(0.92 0.004 286.32)"]}
-            />
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm">
-              Avg Compliance Score by Target
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <BarChart
-              queryKey="submissions_by_target"
-              parameters={{}}
-              xKey="target"
-              yKey="avg_score"
-              height={300}
-              colors={["oklch(0.67 0.12 167)"]}
-            />
-          </CardContent>
-        </Card>
+        <QueueBars
+          title="Remaining by Queue"
+          queues={summary?.queues ?? []}
+          valueKey="remaining"
+        />
+        <QueueBars
+          title="Resolved by Queue"
+          queues={summary?.queues ?? []}
+          valueKey="resolved"
+        />
       </div>
     </div>
   );
@@ -122,14 +193,14 @@ function GenieTab() {
       <CardHeader className="shrink-0 pb-2">
         <CardTitle className="text-sm">Ask Genie</CardTitle>
         <p className="text-xs text-muted-foreground">
-          Ask questions about content submissions, approval rates, compliance
-          scores, and guidelines.
+          Ask questions about staged anomalies, queue progress, review outcomes,
+          and source citations.
         </p>
       </CardHeader>
       <CardContent className="flex-1 overflow-hidden p-0">
         <GenieChat
           alias="default"
-          placeholder="e.g. Which content target has the lowest average compliance score?"
+          placeholder="e.g. Which anomaly queue has the most pending records?"
           className="h-full"
         />
       </CardContent>

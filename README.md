@@ -1,21 +1,46 @@
-# Content Moderator
+# Data Readiness Desk
 
-Content moderation with per-target guidelines, AI compliance scoring, and Lakebase + Genie.
+Facility data readiness review desk with Lakebase-backed anomaly triage, human review workflows, analytics, Genie, and AI-assisted correction suggestions.
 
-## Provisioning
+## Current Implementation
 
-Manual: Lakebase, SQL Warehouse, Genie space over `content_moderation` tables.
+The app now creates a `data_readiness` Lakebase schema on startup and exposes:
 
-**SQL:** `provisioning/sql/00_no_unity_catalog_ddl.sql` — no UC baseline required. The app's
-service principal creates and seeds the `content_moderation` schema (guidelines,
-submissions, reviews) on first startup, so no manual seeding is needed.
+- dashboard and queue review pages
+- indicator review page for facility-to-health-indicator coverage problems
+- demo anomaly sync via `POST /api/readiness/sync`
+- demo indicator issue sync via `POST /api/indicator-reviews/sync`
+- review persistence with audit events
+- AI assist endpoint using `databricks-gpt-5-4-mini`
+- shortlist and scenario CRUD
+- analytics query files for readiness overview and anomalies by queue
 
-AI compliance scoring calls the workspace's built-in Foundation Model API endpoint
-(`databricks-gpt-5-4-mini`) via the app service principal — no extra setup required.
+The sync endpoints currently load bounded demo fixtures. Before production use, confirm the canonical source tables and replace the demo syncs with a Lakeflow Job, approved warehouse-backed sync, or Lakebase synced-table workflow. Indicator review currently stages common indicator coverage problems such as missing facility-to-indicator joins, district mapping gaps, missing metrics, invalid percentage values, outliers, duplicate indicator rows, and stale indicator periods.
+
+## Required Human Decisions
+
+- Fully qualified source tables for facilities, pincode/zip reference, states, districts, coordinates, emails, and phones.
+- Ingestion architecture: Lakeflow Job, app-triggered sync, or Lakebase synced source tables.
+- PII rules for phone/email values sent to Model Serving and retained in Lakebase.
+- Review semantics for reopened/stale records when upstream values change.
+- Genie space reuse or creation for Data Readiness datasets.
+- Scenario semantics and whether shortlists are user, global, or scenario scoped.
 
 ## Setup
 
-Edit `databricks.yml` (REPLACE_ME). Then:
+Edit `databricks.yml` values:
+
+```yaml
+workspace:
+  host: https://<workspace-host>
+variables:
+  sql_warehouse_id: <warehouse-id>
+  genie_space_id: <genie-space-id>
+  postgres_branch: projects/<project>/branches/<branch>
+  postgres_database: projects/<project>/branches/<branch>/databases/<database>
+```
+
+Then:
 
 ```bash
 npm install
@@ -23,42 +48,35 @@ npm run build
 databricks bundle deploy --profile <PROFILE>
 ```
 
-On first startup the app seeds demo data into Lakebase as the app service principal
-(which owns the schema), so the OLTP/CRUD path works without any human pre-seed.
+## Analytics Catalog
 
-```bash
-databricks apps init \
-  --template https://github.com/databricks/app-templates/tree/main/content-moderator \
-  --name content-moderator
-```
-
-## Analytics dashboard (optional)
-
-The dashboard reads Lakebase data from the SQL Warehouse through a Unity Catalog catalog.
-
-> ⚠️ **The catalog name is load-bearing.** The analytics queries in `config/queries/*.sql`
-> hardcode the literal `content_moderation.content_moderation.<table>` (`<catalog>.<schema>.<table>`),
-> and build-time type generation (`prebuild` runs `appkit generate-types --wait`) `DESCRIBE`s
-> them as the app service principal. You must register the catalog with the **exact name
-> `content_moderation`** and grant the SP access **before the next build/deploy** — otherwise
-> typegen can't resolve the columns, emits empty types, and the client build fails. If you prefer
-> a different catalog name, change the three-part names in `config/queries/*.sql` to match.
-
-After the first deploy (which creates the app and its service principal), register the
-Lakebase database as a catalog **named `content_moderation`**:
-
-```bash
-databricks postgres create-catalog content_moderation \
-  --json '{"spec":{"postgres_database":"databricks_postgres","branch":"projects/<project>/branches/<branch>"}}'
-```
-
-Then grant the app service principal read access (build-time type generation runs the
-analytics queries as the SP, so grant before the next build/deploy). Get the SP id with
-`databricks apps get content-moderator -o json | jq -r .service_principal_client_id`, then
-run on the warehouse:
+The analytics SQL files read:
 
 ```sql
-GRANT USE CATALOG ON CATALOG content_moderation TO `<sp-client-id>`;
-GRANT USE SCHEMA ON SCHEMA content_moderation.content_moderation TO `<sp-client-id>`;
-GRANT SELECT ON SCHEMA content_moderation.content_moderation TO `<sp-client-id>`;
+data_readiness.data_readiness.flagged_records
 ```
+
+Register the Lakebase database as a Unity Catalog catalog named `data_readiness`, or update `config/queries/*.sql` to the catalog name you choose. Grant the app service principal access before running type generation or deploying:
+
+```sql
+GRANT USE CATALOG ON CATALOG data_readiness TO `<sp-client-id>`;
+GRANT USE SCHEMA ON SCHEMA data_readiness.data_readiness TO `<sp-client-id>`;
+GRANT SELECT ON SCHEMA data_readiness.data_readiness TO `<sp-client-id>`;
+```
+
+## Verification
+
+```bash
+npm run typecheck
+npm run lint
+npm run lint:ast-grep
+npm run build
+databricks apps validate --profile <PROFILE>
+```
+
+Manual checks:
+
+- Run Sync Data twice and confirm records are not duplicated.
+- Resolve, reject, and nullify records, then reload and confirm state persists.
+- Confirm AI Assist returns a suggestion but does not auto-save it.
+- Confirm analytics and Genie use Data Readiness tables, not old content moderation tables.
