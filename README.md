@@ -15,7 +15,7 @@ The app now creates a `data_readiness` Lakebase schema on startup and exposes:
 - shortlist and scenario CRUD
 - analytics query files for readiness overview and anomalies by queue
 
-The sync endpoints currently load bounded demo fixtures. Before production use, confirm the canonical source tables and replace the demo syncs with a Lakeflow Job, approved warehouse-backed sync, or Lakebase synced-table workflow. Indicator review currently stages common indicator coverage problems such as missing facility-to-indicator joins, district mapping gaps, missing metrics, invalid percentage values, outliers, duplicate indicator rows, and stale indicator periods.
+`POST /api/readiness/sync` now runs a bounded whole-database warehouse scan when `DATABRICKS_HOST`, `DATABRICKS_WAREHOUSE_ID`, and auth are configured. It discovers reviewable tables in `READINESS_SOURCE_CATALOG`, samples recognized facility/contact/location columns, upserts anomalies into Lakebase, and preserves prior human decisions. Use `POST /api/readiness/sync?mode=demo` to load the original fixture. Indicator review still uses a bounded demo fixture until canonical indicator joins are finalized.
 
 ## Required Human Decisions
 
@@ -77,6 +77,19 @@ databricks apps validate --profile <PROFILE>
 Manual checks:
 
 - Run Sync Data twice and confirm records are not duplicated.
+- Run `POST /api/readiness/sync?mode=demo` if you need the prototype fixture instead of the warehouse scan.
 - Resolve, reject, and nullify records, then reload and confirm state persists.
 - Confirm AI Assist returns a suggestion but does not auto-save it.
 - Confirm analytics and Genie use Data Readiness tables, not old content moderation tables.
+
+## Whole-Database Scan Configuration
+
+```bash
+READINESS_SOURCE_CATALOG=databricks_virtue_foundation_dataset_dais_2026
+# Optional: restrict to one schema.
+READINESS_SOURCE_SCHEMA=default
+READINESS_MAX_TABLES=50
+READINESS_MAX_ROWS_PER_TABLE=1000
+```
+
+The scanner is intentionally bounded for app responsiveness. Increase limits cautiously, or move the same anomaly generation into a Lakeflow Job for full production-scale scans.

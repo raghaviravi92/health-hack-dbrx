@@ -266,6 +266,77 @@ const UpdateScenarioBody = CreateScenarioBody.partial().extend({
 
 const SERVING_ENDPOINT = process.env.SERVING_ENDPOINT || "databricks-gpt-5-4-mini";
 const DATABRICKS_HOST = process.env.DATABRICKS_HOST;
+const DATABRICKS_WAREHOUSE_ID = process.env.DATABRICKS_WAREHOUSE_ID;
+const SOURCE_CATALOG =
+  process.env.READINESS_SOURCE_CATALOG ||
+  "databricks_virtue_foundation_dataset_dais_2026";
+const SOURCE_SCHEMA =
+  process.env.READINESS_SOURCE_SCHEMA || "virtue_foundation_dataset";
+const MAX_TABLES_TO_SCAN = Number(process.env.READINESS_MAX_TABLES ?? "50");
+const MAX_ROWS_PER_TABLE = Number(process.env.READINESS_MAX_ROWS_PER_TABLE ?? "1000");
+const MAX_INDICATOR_ISSUES = Number(
+  process.env.READINESS_MAX_INDICATOR_ISSUES ?? "2000",
+);
+
+interface SqlColumn {
+  name: string;
+}
+
+interface SqlStatementResponse {
+  statement_id?: string;
+  status?: {
+    state?: string;
+    error?: {
+      message?: string;
+    };
+  };
+  manifest?: {
+    schema?: {
+      columns?: SqlColumn[];
+    };
+  };
+  result?: {
+    data_array?: unknown[][];
+  };
+}
+
+interface SourceTable {
+  table_schema: string;
+  table_name: string;
+}
+
+interface ColumnMapping {
+  id?: string;
+  name?: string;
+  zip?: string;
+  email?: string;
+  phone?: string;
+  state?: string;
+  district?: string;
+  latitude?: string;
+  longitude?: string;
+}
+
+interface SourceAnomaly {
+  facility_id: string;
+  facility_name: string;
+  field_name: (typeof FIELD_NAMES)[number];
+  anomaly_type: string;
+  source_catalog: string;
+  source_schema: string;
+  source_table: string;
+  source_column: string;
+  source_record_id: string;
+  source_value_hash: string;
+  original_value: string | null;
+  suggested_value: string | null;
+  suggestion_method: "regex" | "reference_lookup" | "model" | "manual" | "none";
+  suggestion_explanation: string;
+  validation_state: "valid" | "invalid" | "unvalidated";
+  state_context: string | null;
+  district_context: string | null;
+  citation: Record<string, unknown>;
+}
 
 function actorEmail(
   req: { header(name: string): string | undefined },
@@ -278,6 +349,157 @@ function normalizeHost(host: string | undefined): string | null {
   if (!host) return null;
   const trimmed = host.replace(/\/$/, "");
   return /^https?:\/\//.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
+function quoteIdentifier(identifier: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(identifier)) {
+    throw new Error(`Unsafe SQL identifier: ${identifier}`);
+  }
+  return `\`${identifier.replace(/`/g, "``")}\``;
+}
+
+function rowValue(row: Record<string, unknown>, column: string | undefined): string | null {
+  if (!column) return null;
+  const value = row[column];
+  if (value === null || value === undefined) return null;
+  const text = String(value).trim();
+  return text.length > 0 ? text : null;
+}
+
+function stableHash(parts: Array<string | null | undefined>): string {
+  let hash = 2166136261;
+  const text = parts.map((part) => part ?? "").join("\u001f");
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function normalizeColumnName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function pickColumn(columns: string[], patterns: RegExp[]): string | undefined {
+  return columns.find((column) =>
+    patterns.some((pattern) => pattern.test(normalizeColumnName(column))),
+  );
+}
+
+function columnMapping(columns: string[]): ColumnMapping {
+  return {
+    id: pickColumn(columns, [
+      /uniqueid/,
+      /^(facility|site|provider|record|row)?id$/,
+      /facilityid/,
+      /facilitycode/,
+      /sourceid/,
+    ]),
+    name: pickColumn(columns, [
+      /facilityname/,
+      /facility/,
+      /sitename/,
+      /providername/,
+      /name$/,
+    ]),
+    zip: pickColumn(columns, [
+      /pincode/,
+      /postalcode/,
+      /postcode/,
+      /zipcode/,
+      /ziporpostcode/,
+      /^zip$/,
+      /^pin$/,
+    ]),
+    email: pickColumn(columns, [/email/, /mailid/]),
+    phone: pickColumn(columns, [/phone/, /mobile/, /contactnumber/, /telephone/]),
+    state: pickColumn(columns, [/^state$/, /statename/, /stateut/, /region/]),
+    district: pickColumn(columns, [/district/, /distname/]),
+    latitude: pickColumn(columns, [/^lat$/, /latitude/]),
+    longitude: pickColumn(columns, [/^lon$/, /^lng$/, /longitude/]),
+  };
+}
+
+function hasReviewableColumns(mapping: ColumnMapping): boolean {
+  return Boolean(
+    mapping.zip ||
+      mapping.email ||
+      mapping.phone ||
+      mapping.state ||
+      mapping.district ||
+      (mapping.latitude && mapping.longitude),
+  );
+}
+
+function tableFqn(table: SourceTable): string {
+  return [
+    quoteIdentifier(SOURCE_CATALOG),
+    quoteIdentifier(table.table_schema),
+    quoteIdentifier(table.table_name),
+  ].join(".");
+}
+
+function sourceTableFqn(tableName: string): string {
+  return [
+    quoteIdentifier(SOURCE_CATALOG),
+    quoteIdentifier(SOURCE_SCHEMA),
+    quoteIdentifier(tableName),
+  ].join(".");
+}
+
+async function executeWarehouseSql(
+  statement: string,
+  params: unknown[] = [],
+): Promise<Record<string, unknown>[]> {
+  const host = normalizeHost(DATABRICKS_HOST);
+  const token = await getDatabricksToken();
+  if (!host || !token || !DATABRICKS_WAREHOUSE_ID) {
+    throw new Error("Databricks host, token, or warehouse is not configured");
+  }
+
+  const initial = await fetch(`${host}/api/2.0/sql/statements`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({
+      statement,
+      warehouse_id: DATABRICKS_WAREHOUSE_ID,
+      wait_timeout: "30s",
+      disposition: "INLINE",
+      parameters: params.map((value, index) => ({
+        name: `p${index + 1}`,
+        value: value === null || value === undefined ? null : String(value),
+      })),
+    }),
+  });
+  if (!initial.ok) {
+    throw new Error(`SQL statement request failed with ${initial.status}`);
+  }
+
+  let payload = (await initial.json()) as SqlStatementResponse;
+  for (let attempt = 0; payload.status?.state === "PENDING" && attempt < 20; attempt += 1) {
+    if (!payload.statement_id) break;
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const polled = await fetch(`${host}/api/2.0/sql/statements/${payload.statement_id}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!polled.ok) {
+      throw new Error(`SQL statement poll failed with ${polled.status}`);
+    }
+    payload = (await polled.json()) as SqlStatementResponse;
+  }
+
+  if (payload.status?.state !== "SUCCEEDED") {
+    throw new Error(payload.status?.error?.message ?? "SQL statement failed");
+  }
+
+  const columns = payload.manifest?.schema?.columns?.map((column) => column.name) ?? [];
+  const data = payload.result?.data_array ?? [];
+  return data.map((values) =>
+    Object.fromEntries(columns.map((column, index) => [column, values[index] ?? null])),
+  );
 }
 
 async function getDatabricksToken(): Promise<string | null> {
@@ -591,6 +813,225 @@ function fieldValidator(fieldName: string, value: string | null): string {
   return "unvalidated";
 }
 
+async function discoverSourceTables(): Promise<Array<{ table: SourceTable; columns: string[] }>> {
+  const schemaFilter = SOURCE_SCHEMA ? "AND table_schema = :p2" : "";
+  const tableRows = await executeWarehouseSql(
+    `SELECT table_schema, table_name
+     FROM ${quoteIdentifier(SOURCE_CATALOG)}.information_schema.tables
+     WHERE table_catalog = :p1
+       AND table_type IN (
+         'BASE TABLE',
+         'VIEW',
+         'MANAGED',
+         'EXTERNAL',
+         'MATERIALIZED_VIEW',
+         'STREAMING_TABLE'
+       )
+       ${schemaFilter}
+     ORDER BY table_schema, table_name
+     LIMIT ${Math.max(1, MAX_TABLES_TO_SCAN)}`,
+    SOURCE_SCHEMA ? [SOURCE_CATALOG, SOURCE_SCHEMA] : [SOURCE_CATALOG],
+  );
+  const tables = tableRows.map((row) => ({
+    table_schema: String(row.table_schema),
+    table_name: String(row.table_name),
+  }));
+  if (tables.length === 0) return [];
+
+  const columnSchemaFilter = SOURCE_SCHEMA ? "AND table_schema = :p2" : "";
+  const columnRows = await executeWarehouseSql(
+    `SELECT table_schema, table_name, column_name
+     FROM ${quoteIdentifier(SOURCE_CATALOG)}.information_schema.columns
+     WHERE table_catalog = :p1
+       ${columnSchemaFilter}
+     ORDER BY table_schema, table_name, ordinal_position`,
+    SOURCE_SCHEMA ? [SOURCE_CATALOG, SOURCE_SCHEMA] : [SOURCE_CATALOG],
+  );
+  const byTable = new Map<string, string[]>();
+  for (const row of columnRows) {
+    const tableSchema = String(row.table_schema);
+    const tableName = String(row.table_name);
+    const columnName = String(row.column_name);
+    const key = `${tableSchema}.${tableName}`;
+    byTable.set(key, [...(byTable.get(key) ?? []), columnName]);
+  }
+
+  return tables
+    .map((table) => ({
+      table,
+      columns: byTable.get(`${table.table_schema}.${table.table_name}`) ?? [],
+    }))
+    .filter((entry) => hasReviewableColumns(columnMapping(entry.columns)));
+}
+
+function anomalyBase(
+  table: SourceTable,
+  mapping: ColumnMapping,
+  row: Record<string, unknown>,
+  fieldName: (typeof FIELD_NAMES)[number],
+  sourceColumn: string,
+  originalValue: string | null,
+): Pick<
+  SourceAnomaly,
+  | "facility_id"
+  | "facility_name"
+  | "field_name"
+  | "source_catalog"
+  | "source_schema"
+  | "source_table"
+  | "source_column"
+  | "source_record_id"
+  | "source_value_hash"
+  | "original_value"
+  | "state_context"
+  | "district_context"
+  | "citation"
+> {
+  const facilityId =
+    rowValue(row, mapping.id) ??
+    `${SOURCE_CATALOG}.${table.table_schema}.${table.table_name}:${stableHash([
+      JSON.stringify(row),
+    ])}`;
+  const facilityName =
+    rowValue(row, mapping.name) ??
+    `${table.table_schema}.${table.table_name} record`;
+  const sourceRecordId = `${facilityId}:${sourceColumn}`;
+  return {
+    facility_id: facilityId,
+    facility_name: facilityName,
+    field_name: fieldName,
+    source_catalog: SOURCE_CATALOG,
+    source_schema: table.table_schema,
+    source_table: table.table_name,
+    source_column: sourceColumn,
+    source_record_id: sourceRecordId,
+    source_value_hash: `${fieldName}-${stableHash([sourceRecordId, originalValue])}`,
+    original_value: originalValue,
+    state_context: rowValue(row, mapping.state),
+    district_context: rowValue(row, mapping.district),
+    citation: {
+      source_table: `${SOURCE_CATALOG}.${table.table_schema}.${table.table_name}`,
+      source_column: sourceColumn,
+      source_record_id: sourceRecordId,
+      scan_mode: "whole_database",
+    },
+  };
+}
+
+function analyzeRow(
+  table: SourceTable,
+  mapping: ColumnMapping,
+  row: Record<string, unknown>,
+): SourceAnomaly[] {
+  const anomalies: SourceAnomaly[] = [];
+  const zip = rowValue(row, mapping.zip);
+  if (mapping.zip && zip && !/^\d{6}$/.test(zip)) {
+    const extracted = zip.match(/\d{6}/)?.[0] ?? null;
+    anomalies.push({
+      ...anomalyBase(table, mapping, row, "zip", mapping.zip, zip),
+      anomaly_type: extracted ? "embedded_pincode_text" : "invalid_pincode",
+      suggested_value: extracted,
+      suggestion_method: extracted ? "regex" : "none",
+      suggestion_explanation: extracted
+        ? "Extracted a six-digit PIN code from a mixed-format value."
+        : "PIN code value is not a six-digit code.",
+      validation_state: extracted ? "valid" : "invalid",
+    });
+  }
+
+  const email = rowValue(row, mapping.email);
+  if (
+    mapping.email &&
+    email &&
+    (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+      /\[at\]|\(at\)|\sat\s|emailprotected|null/i.test(email))
+  ) {
+    const suggested = email
+      .replace(/\s*\[at\]\s*|\s*\(at\)\s*|\s+at\s+/i, "@")
+      .replace(/\s*\[dot\]\s*|\s*\(dot\)\s*|\s+dot\s+/i, ".")
+      .trim();
+    anomalies.push({
+      ...anomalyBase(table, mapping, row, "email", mapping.email, email),
+      anomaly_type: "malformed_email",
+      suggested_value: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(suggested)
+        ? suggested
+        : null,
+      suggestion_method: "regex",
+      suggestion_explanation:
+        "Email value appears malformed, obfuscated, or contains scraping artifacts.",
+      validation_state: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(suggested)
+        ? "valid"
+        : "invalid",
+    });
+  }
+
+  const phone = rowValue(row, mapping.phone);
+  if (mapping.phone && phone) {
+    const digits = phone.replace(/\D/g, "");
+    const hasPhoneShape = digits.length >= 8 && digits.length <= 15;
+    const cleanPhone = digits.length === 10 ? `+91${digits}` : `+${digits}`;
+    if (!/^\+?\d[\d\s-]{7,}$/.test(phone) || phone !== cleanPhone) {
+      anomalies.push({
+        ...anomalyBase(table, mapping, row, "phone", mapping.phone, phone),
+        anomaly_type: hasPhoneShape ? "embedded_phone_text" : "invalid_phone",
+        suggested_value: hasPhoneShape ? cleanPhone : null,
+        suggestion_method: hasPhoneShape ? "regex" : "none",
+        suggestion_explanation: hasPhoneShape
+          ? "Extracted a normalized phone number from a mixed-format value."
+          : "Phone value does not contain a plausible phone number.",
+        validation_state: hasPhoneShape ? "valid" : "invalid",
+      });
+    }
+  }
+
+  const latitude = rowValue(row, mapping.latitude);
+  const longitude = rowValue(row, mapping.longitude);
+  if (mapping.latitude && mapping.longitude && latitude && longitude) {
+    const lat = Number(latitude);
+    const lon = Number(longitude);
+    const inIndia = lat >= 6 && lat <= 38 && lon >= 68 && lon <= 98;
+    const swapped = lon >= 6 && lon <= 38 && lat >= 68 && lat <= 98;
+    if (!Number.isFinite(lat) || !Number.isFinite(lon) || !inIndia) {
+      anomalies.push({
+        ...anomalyBase(
+          table,
+          mapping,
+          row,
+          "coords",
+          `${mapping.latitude},${mapping.longitude}`,
+          `${latitude}, ${longitude}`,
+        ),
+        anomaly_type: swapped ? "latitude_longitude_swapped" : "coordinates_out_of_bounds",
+        suggested_value: swapped ? `${longitude}, ${latitude}` : null,
+        suggestion_method: swapped ? "regex" : "none",
+        suggestion_explanation: swapped
+          ? "Latitude and longitude appear swapped for India coordinate bounds."
+          : "Coordinates are missing, non-numeric, or outside India coordinate bounds.",
+        validation_state: swapped ? "valid" : "invalid",
+      });
+    }
+  }
+
+  for (const [fieldName, column] of [
+    ["state", mapping.state],
+    ["district", mapping.district],
+  ] as const) {
+    const value = rowValue(row, column);
+    if (column && value && (/^(na|null|unknown|n\/a)$/i.test(value) || /\d/.test(value))) {
+      anomalies.push({
+        ...anomalyBase(table, mapping, row, fieldName, column, value),
+        anomaly_type: `${fieldName}_needs_review`,
+        suggested_value: null,
+        suggestion_method: "none",
+        suggestion_explanation: `${fieldName} value is blank-like or contains unexpected digits.`,
+        validation_state: "unvalidated",
+      });
+    }
+  }
+
+  return anomalies;
+}
+
 async function setupSchema(appkit: AppKitWithLakebase): Promise<void> {
   for (const statement of SETUP_SQL) {
     await appkit.lakebase.query(statement);
@@ -699,6 +1140,149 @@ async function runDemoSync(
   }
 }
 
+async function upsertSourceAnomaly(
+  appkit: AppKitWithLakebase,
+  anomaly: SourceAnomaly,
+  syncRunId: string,
+): Promise<number> {
+  const result = await appkit.lakebase.query(
+    `INSERT INTO data_readiness.flagged_records (
+      facility_id, facility_name, field_name, anomaly_type,
+      source_catalog, source_schema, source_table, source_column,
+      source_record_id, source_value_hash, original_value, suggested_value,
+      suggestion_method, suggestion_explanation, validation_state,
+      state_context, district_context, citation, status, sync_run_id
+    )
+    VALUES (
+      $1, $2, $3, $4,
+      $5, $6, $7, $8,
+      $9, $10, $11, $12,
+      $13, $14, $15,
+      $16, $17, $18::jsonb, 'pending', $19::uuid
+    )
+    ON CONFLICT (
+      facility_id, field_name, anomaly_type, source_record_id, source_value_hash
+    )
+    DO UPDATE SET
+      facility_name = EXCLUDED.facility_name,
+      suggested_value = EXCLUDED.suggested_value,
+      suggestion_method = EXCLUDED.suggestion_method,
+      suggestion_explanation = EXCLUDED.suggestion_explanation,
+      validation_state = EXCLUDED.validation_state,
+      state_context = EXCLUDED.state_context,
+      district_context = EXCLUDED.district_context,
+      citation = EXCLUDED.citation,
+      sync_run_id = EXCLUDED.sync_run_id,
+      status = CASE
+        WHEN data_readiness.flagged_records.status IN ('resolved', 'rejected', 'nullified')
+          THEN data_readiness.flagged_records.status
+        ELSE EXCLUDED.status
+      END,
+      updated_at = NOW()
+    RETURNING id::text`,
+    [
+      anomaly.facility_id,
+      anomaly.facility_name,
+      anomaly.field_name,
+      anomaly.anomaly_type,
+      anomaly.source_catalog,
+      anomaly.source_schema,
+      anomaly.source_table,
+      anomaly.source_column,
+      anomaly.source_record_id,
+      anomaly.source_value_hash,
+      anomaly.original_value,
+      anomaly.suggested_value,
+      anomaly.suggestion_method,
+      anomaly.suggestion_explanation,
+      anomaly.validation_state,
+      anomaly.state_context,
+      anomaly.district_context,
+      JSON.stringify(anomaly.citation),
+      syncRunId,
+    ],
+  );
+  return result.rows.length;
+}
+
+async function runWarehouseDatabaseSync(
+  appkit: AppKitWithLakebase,
+  startedBy: string,
+): Promise<Record<string, unknown>> {
+  const sourceDescription = SOURCE_SCHEMA
+    ? `whole database scan of ${SOURCE_CATALOG}.${SOURCE_SCHEMA}`
+    : `whole database scan of ${SOURCE_CATALOG}`;
+  const syncRun = await appkit.lakebase.query(
+    `INSERT INTO data_readiness.sync_runs (status, source_description, started_by)
+     VALUES ('running', $1, $2)
+     RETURNING id::text, started_at`,
+    [sourceDescription, startedBy],
+  );
+  const syncRunId = syncRun.rows[0].id as string;
+  let scanned = 0;
+  let upserted = 0;
+
+  try {
+    const tables = await discoverSourceTables();
+    for (const { table, columns } of tables) {
+      const mapping = columnMapping(columns);
+      const selectedColumns = Array.from(
+        new Set(
+          Object.values(mapping).filter(
+            (column): column is string => typeof column === "string",
+          ),
+        ),
+      );
+      if (selectedColumns.length === 0) continue;
+
+      const rows = await executeWarehouseSql(
+        `SELECT ${selectedColumns.map(quoteIdentifier).join(", ")}
+         FROM ${tableFqn(table)}
+         LIMIT ${Math.max(1, MAX_ROWS_PER_TABLE)}`,
+      );
+      scanned += rows.length;
+      for (const row of rows) {
+        const anomalies = analyzeRow(table, mapping, row);
+        for (const anomaly of anomalies) {
+          upserted += await upsertSourceAnomaly(appkit, anomaly, syncRunId);
+        }
+      }
+    }
+
+    const completed = await appkit.lakebase.query(
+      `UPDATE data_readiness.sync_runs
+       SET status = 'completed',
+           finished_at = NOW(),
+           records_scanned = $2,
+           records_upserted = $3
+       WHERE id = $1::uuid
+       RETURNING id::text, status, source_description, started_by, started_at,
+         finished_at, records_scanned, records_upserted, error_message`,
+      [syncRunId, scanned, upserted],
+    );
+    return completed.rows[0];
+  } catch (err) {
+    const failed = await appkit.lakebase.query(
+      `UPDATE data_readiness.sync_runs
+       SET status = 'failed',
+           finished_at = NOW(),
+           records_scanned = $2,
+           records_upserted = $3,
+           error_message = $4
+       WHERE id = $1::uuid
+       RETURNING id::text, status, source_description, started_by, started_at,
+         finished_at, records_scanned, records_upserted, error_message`,
+      [
+        syncRunId,
+        scanned,
+        upserted,
+        err instanceof Error ? err.message : "Whole database sync failed",
+      ],
+    );
+    return failed.rows[0];
+  }
+}
+
 async function runDemoIndicatorSync(
   appkit: AppKitWithLakebase,
   startedBy: string,
@@ -799,6 +1383,307 @@ async function runDemoIndicatorSync(
   }
 }
 
+async function upsertIndicatorIssue(
+  appkit: AppKitWithLakebase,
+  issue: z.infer<typeof IndicatorIssue>,
+  syncRunId: string,
+): Promise<number> {
+  const d = IndicatorIssue.parse(issue);
+  const result = await appkit.lakebase.query(
+    `INSERT INTO data_readiness.indicator_reviews (
+      issue_key, facility_id, facility_name, state, district,
+      indicator_table, indicator_name, issue_type, severity,
+      current_value, suggested_value, suggestion_explanation,
+      source_record_id, reference_record_id, citation, status, sync_run_id
+    )
+    VALUES (
+      $1, $2, $3, $4, $5,
+      $6, $7, $8, $9,
+      $10, $11, $12,
+      $13, $14, $15::jsonb, 'pending', $16::uuid
+    )
+    ON CONFLICT (issue_key)
+    DO UPDATE SET
+      facility_name = EXCLUDED.facility_name,
+      state = EXCLUDED.state,
+      district = EXCLUDED.district,
+      indicator_table = EXCLUDED.indicator_table,
+      indicator_name = EXCLUDED.indicator_name,
+      issue_type = EXCLUDED.issue_type,
+      severity = EXCLUDED.severity,
+      current_value = EXCLUDED.current_value,
+      suggested_value = EXCLUDED.suggested_value,
+      suggestion_explanation = EXCLUDED.suggestion_explanation,
+      source_record_id = EXCLUDED.source_record_id,
+      reference_record_id = EXCLUDED.reference_record_id,
+      citation = EXCLUDED.citation,
+      sync_run_id = EXCLUDED.sync_run_id,
+      status = CASE
+        WHEN data_readiness.indicator_reviews.status IN ('resolved', 'accepted', 'ignored')
+          THEN data_readiness.indicator_reviews.status
+        ELSE EXCLUDED.status
+      END,
+      updated_at = NOW()
+    RETURNING id::text`,
+    [
+      d.issue_key,
+      d.facility_id,
+      d.facility_name,
+      d.state,
+      d.district,
+      d.indicator_table,
+      d.indicator_name,
+      d.issue_type,
+      d.severity,
+      d.current_value,
+      d.suggested_value,
+      d.suggestion_explanation,
+      d.source_record_id,
+      d.reference_record_id,
+      JSON.stringify(d.citation),
+      syncRunId,
+    ],
+  );
+  return result.rows.length;
+}
+
+function indicatorIssueFromRow(
+  row: Record<string, unknown>,
+  syncRunId: string,
+): z.infer<typeof IndicatorIssue> {
+  return {
+    issue_key: String(row.issue_key),
+    facility_id: String(row.facility_id),
+    facility_name: String(row.facility_name),
+    state: rowValue(row, "state"),
+    district: rowValue(row, "district"),
+    indicator_table: `${SOURCE_CATALOG}.${SOURCE_SCHEMA}.nfhs_5_district_health_indicators`,
+    indicator_name: rowValue(row, "indicator_name"),
+    issue_type: row.issue_type as z.infer<typeof IndicatorIssue>["issue_type"],
+    severity: row.severity as z.infer<typeof IndicatorIssue>["severity"],
+    current_value: rowValue(row, "current_value"),
+    suggested_value: rowValue(row, "suggested_value"),
+    suggestion_explanation: String(row.suggestion_explanation),
+    source_record_id: rowValue(row, "source_record_id"),
+    reference_record_id: rowValue(row, "reference_record_id"),
+    citation: {
+      facility_table: `${SOURCE_CATALOG}.${SOURCE_SCHEMA}.facilities`,
+      pincode_table: `${SOURCE_CATALOG}.${SOURCE_SCHEMA}.india_post_pincode_directory`,
+      indicator_table: `${SOURCE_CATALOG}.${SOURCE_SCHEMA}.nfhs_5_district_health_indicators`,
+      indicator_column: rowValue(row, "indicator_column"),
+      sync_run_id: syncRunId,
+      scan_mode: "warehouse_indicator_sync",
+    },
+  };
+}
+
+async function warehouseIndicatorIssues(syncRunId: string) {
+  const facilities = sourceTableFqn("facilities");
+  const pincodes = sourceTableFqn("india_post_pincode_directory");
+  const indicators = sourceTableFqn("nfhs_5_district_health_indicators");
+  const missingJoinRows = await executeWarehouseSql(
+    `WITH facility_rows AS (
+       SELECT
+         CAST(unique_id AS STRING) AS facility_id,
+         CAST(name AS STRING) AS facility_name,
+         CAST(address_zipOrPostcode AS STRING) AS zip_raw,
+         regexp_extract(CAST(address_zipOrPostcode AS STRING), '(\\\\d{6})', 1) AS pincode
+       FROM ${facilities}
+     ),
+     pincode_rows AS (
+       SELECT
+         CAST(pincode AS STRING) AS pincode,
+         MIN(CAST(statename AS STRING)) AS state,
+         MIN(CAST(district AS STRING)) AS district
+       FROM ${pincodes}
+       GROUP BY CAST(pincode AS STRING)
+     ),
+     indicator_districts AS (
+       SELECT
+         upper(trim(CAST(state_ut AS STRING))) AS state_key,
+         upper(trim(CAST(district_name AS STRING))) AS district_key,
+         MIN(CAST(state_ut AS STRING)) AS state,
+         MIN(CAST(district_name AS STRING)) AS district
+       FROM ${indicators}
+       GROUP BY upper(trim(CAST(state_ut AS STRING))), upper(trim(CAST(district_name AS STRING)))
+     )
+     SELECT
+       concat('indicator:', facility_rows.facility_id, ':missing_join:', coalesce(pincode_rows.pincode, 'no-pincode')) AS issue_key,
+       facility_rows.facility_id,
+       facility_rows.facility_name,
+       pincode_rows.state,
+       pincode_rows.district,
+       CAST(NULL AS STRING) AS indicator_name,
+       'missing_indicator_join' AS issue_type,
+       CASE WHEN pincode_rows.pincode IS NULL THEN 'critical' ELSE 'high' END AS severity,
+       CASE
+         WHEN pincode_rows.pincode IS NULL THEN concat('No pincode directory match for ', coalesce(facility_rows.zip_raw, 'blank zip'))
+         ELSE concat('No NFHS-5 district indicator row for ', pincode_rows.state, ' / ', pincode_rows.district)
+       END AS current_value,
+       CAST(NULL AS STRING) AS suggested_value,
+       CASE
+         WHEN pincode_rows.pincode IS NULL THEN 'Review or correct the facility PIN code before joining health indicators.'
+         ELSE 'Review district naming or parent-district mapping before joining NFHS-5 indicators.'
+       END AS suggestion_explanation,
+       facility_rows.facility_id AS source_record_id,
+       CAST(NULL AS STRING) AS reference_record_id,
+       CAST(NULL AS STRING) AS indicator_column
+     FROM facility_rows
+     LEFT JOIN pincode_rows ON facility_rows.pincode = pincode_rows.pincode
+     LEFT JOIN indicator_districts
+       ON upper(trim(pincode_rows.state)) = indicator_districts.state_key
+      AND upper(trim(pincode_rows.district)) = indicator_districts.district_key
+     WHERE indicator_districts.district_key IS NULL
+     ORDER BY severity, facility_rows.facility_id
+     LIMIT ${Math.max(1, MAX_INDICATOR_ISSUES)}`,
+  );
+
+  const metricRows = await executeWarehouseSql(
+    `WITH metric_issues AS (
+       SELECT
+         concat('indicator:nfhs:invalid_metric:', upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING))), ':institutional_birth_5y_pct') AS issue_key,
+         concat('NFHS5:', upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING)))) AS facility_id,
+         concat('NFHS-5 ', trim(CAST(district_name AS STRING)), ', ', trim(CAST(state_ut AS STRING))) AS facility_name,
+         CAST(state_ut AS STRING) AS state,
+         CAST(district_name AS STRING) AS district,
+         'Institutional births' AS indicator_name,
+         'invalid_metric_value' AS issue_type,
+         'high' AS severity,
+         CAST(institutional_birth_5y_pct AS STRING) AS current_value,
+         CAST(NULL AS STRING) AS suggested_value,
+         'Percentage indicators should be between 0 and 100.' AS suggestion_explanation,
+         concat(upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING)))) AS source_record_id,
+         concat('NFHS5:', upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING)))) AS reference_record_id,
+         'institutional_birth_5y_pct' AS indicator_column
+       FROM ${indicators}
+       WHERE try_cast(trim(CAST(institutional_birth_5y_pct AS STRING)) AS DOUBLE) < 0
+          OR try_cast(trim(CAST(institutional_birth_5y_pct AS STRING)) AS DOUBLE) > 100
+       UNION ALL
+       SELECT
+         concat('indicator:nfhs:missing_metric:', upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING))), ':mothers_who_had_at_least_4_anc_visits_lb5y_pct') AS issue_key,
+         concat('NFHS5:', upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING)))) AS facility_id,
+         concat('NFHS-5 ', trim(CAST(district_name AS STRING)), ', ', trim(CAST(state_ut AS STRING))) AS facility_name,
+         CAST(state_ut AS STRING) AS state,
+         CAST(district_name AS STRING) AS district,
+         'Mothers who had at least 4 antenatal care visits' AS indicator_name,
+         'missing_metric_value' AS issue_type,
+         'medium' AS severity,
+         CAST(mothers_who_had_at_least_4_anc_visits_lb5y_pct AS STRING) AS current_value,
+         CAST(NULL AS STRING) AS suggested_value,
+         'NFHS-5 metric is blank or marked NA and needs review before enrichment.' AS suggestion_explanation,
+         concat(upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING)))) AS source_record_id,
+         concat('NFHS5:', upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING)))) AS reference_record_id,
+         'mothers_who_had_at_least_4_anc_visits_lb5y_pct' AS indicator_column
+       FROM ${indicators}
+       WHERE upper(trim(CAST(mothers_who_had_at_least_4_anc_visits_lb5y_pct AS STRING))) IN ('', 'NA', 'N/A', 'NULL')
+       UNION ALL
+       SELECT
+         concat('indicator:nfhs:outlier:', upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING))), ':child_stunting') AS issue_key,
+         concat('NFHS5:', upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING)))) AS facility_id,
+         concat('NFHS-5 ', trim(CAST(district_name AS STRING)), ', ', trim(CAST(state_ut AS STRING))) AS facility_name,
+         CAST(state_ut AS STRING) AS state,
+         CAST(district_name AS STRING) AS district,
+         'Children under 5 years who are stunted' AS indicator_name,
+         'metric_outlier' AS issue_type,
+         'medium' AS severity,
+         CAST(child_u5_who_are_stunted_height_for_age_18_pct AS STRING) AS current_value,
+         CAST(NULL AS STRING) AS suggested_value,
+         'Stunting percentage is outside broad expected bounds and should be reviewed.' AS suggestion_explanation,
+         concat(upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING)))) AS source_record_id,
+         concat('NFHS5:', upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING)))) AS reference_record_id,
+         'child_u5_who_are_stunted_height_for_age_18_pct' AS indicator_column
+       FROM ${indicators}
+       WHERE try_cast(trim(CAST(child_u5_who_are_stunted_height_for_age_18_pct AS STRING)) AS DOUBLE) < 5
+          OR try_cast(trim(CAST(child_u5_who_are_stunted_height_for_age_18_pct AS STRING)) AS DOUBLE) > 70
+     )
+     SELECT *
+     FROM metric_issues
+     LIMIT ${Math.max(1, Math.floor(MAX_INDICATOR_ISSUES / 2))}`,
+  );
+
+  const duplicateRows = await executeWarehouseSql(
+    `SELECT
+       concat('indicator:nfhs:duplicate:', upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING)))) AS issue_key,
+       concat('NFHS5:', upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING)))) AS facility_id,
+       concat('NFHS-5 ', trim(CAST(district_name AS STRING)), ', ', trim(CAST(state_ut AS STRING))) AS facility_name,
+       CAST(state_ut AS STRING) AS state,
+       CAST(district_name AS STRING) AS district,
+       CAST(NULL AS STRING) AS indicator_name,
+       'duplicate_indicator_row' AS issue_type,
+       'low' AS severity,
+       concat(CAST(COUNT(*) AS STRING), ' duplicate NFHS rows for state/district') AS current_value,
+       'Use one trusted NFHS-5 district row after dedupe' AS suggested_value,
+       'Duplicate state/district indicator rows can multiply facility enrichment results.' AS suggestion_explanation,
+       concat(upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING)))) AS source_record_id,
+       concat('NFHS5:', upper(trim(CAST(state_ut AS STRING))), ':', upper(trim(CAST(district_name AS STRING)))) AS reference_record_id,
+       CAST(NULL AS STRING) AS indicator_column
+     FROM ${indicators}
+     GROUP BY state_ut, district_name
+     HAVING COUNT(*) > 1
+     LIMIT ${Math.max(1, Math.floor(MAX_INDICATOR_ISSUES / 4))}`,
+  );
+
+  return [...missingJoinRows, ...metricRows, ...duplicateRows].map((row) =>
+    indicatorIssueFromRow(row, syncRunId),
+  );
+}
+
+async function runWarehouseIndicatorSync(
+  appkit: AppKitWithLakebase,
+  startedBy: string,
+): Promise<Record<string, unknown>> {
+  const sourceDescription = `warehouse indicator scan of ${SOURCE_CATALOG}.${SOURCE_SCHEMA}`;
+  const syncRun = await appkit.lakebase.query(
+    `INSERT INTO data_readiness.sync_runs (status, source_description, started_by)
+     VALUES ('running', $1, $2)
+     RETURNING id::text, started_at`,
+    [sourceDescription, startedBy],
+  );
+  const syncRunId = syncRun.rows[0].id as string;
+  let scanned = 0;
+  let upserted = 0;
+
+  try {
+    const issues = await warehouseIndicatorIssues(syncRunId);
+    scanned = issues.length;
+    for (const issue of issues) {
+      upserted += await upsertIndicatorIssue(appkit, issue, syncRunId);
+    }
+
+    const completed = await appkit.lakebase.query(
+      `UPDATE data_readiness.sync_runs
+       SET status = 'completed',
+           finished_at = NOW(),
+           records_scanned = $2,
+           records_upserted = $3
+       WHERE id = $1::uuid
+       RETURNING id::text, status, source_description, started_by, started_at,
+         finished_at, records_scanned, records_upserted, error_message`,
+      [syncRunId, scanned, upserted],
+    );
+    return completed.rows[0];
+  } catch (err) {
+    const failed = await appkit.lakebase.query(
+      `UPDATE data_readiness.sync_runs
+       SET status = 'failed',
+           finished_at = NOW(),
+           records_scanned = $2,
+           records_upserted = $3,
+           error_message = $4
+       WHERE id = $1::uuid
+       RETURNING id::text, status, source_description, started_by, started_at,
+         finished_at, records_scanned, records_upserted, error_message`,
+      [
+        syncRunId,
+        scanned,
+        upserted,
+        err instanceof Error ? err.message : "Indicator sync failed",
+      ],
+    );
+    return failed.rows[0];
+  }
+}
+
 export async function setupReadinessRoutes(appkit: AppKitWithLakebase) {
   try {
     await setupSchema(appkit);
@@ -810,7 +1695,17 @@ export async function setupReadinessRoutes(appkit: AppKitWithLakebase) {
   appkit.server.extend((app) => {
     app.post("/api/readiness/sync", async (req, res) => {
       try {
-        const result = await runDemoSync(appkit, actorEmail(req));
+        const mode = z
+          .enum(["auto", "demo", "warehouse"])
+          .default("auto")
+          .parse(req.query.mode ?? "auto");
+        const useDemo =
+          mode === "demo" ||
+          (mode === "auto" &&
+            (!normalizeHost(DATABRICKS_HOST) || !DATABRICKS_WAREHOUSE_ID));
+        const result = useDemo
+          ? await runDemoSync(appkit, actorEmail(req))
+          : await runWarehouseDatabaseSync(appkit, actorEmail(req));
         res.status(result.status === "failed" ? 500 : 201).json(result);
       } catch (err) {
         console.error("[readiness] Sync failed:", err);
@@ -1121,7 +2016,17 @@ END_USER_INSTRUCTION`;
 
     app.post("/api/indicator-reviews/sync", async (req, res) => {
       try {
-        const result = await runDemoIndicatorSync(appkit, actorEmail(req));
+        const mode = z
+          .enum(["auto", "demo", "warehouse"])
+          .default("auto")
+          .parse(req.query.mode ?? "auto");
+        const useDemo =
+          mode === "demo" ||
+          (mode === "auto" &&
+            (!normalizeHost(DATABRICKS_HOST) || !DATABRICKS_WAREHOUSE_ID));
+        const result = useDemo
+          ? await runDemoIndicatorSync(appkit, actorEmail(req))
+          : await runWarehouseIndicatorSync(appkit, actorEmail(req));
         res.status(result.status === "failed" ? 500 : 201).json(result);
       } catch (err) {
         console.error("[readiness] Indicator sync failed:", err);

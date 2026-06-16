@@ -1,5 +1,7 @@
 command: ["npm", "run", "start"]
 env:
+  - name: DATABRICKS_HOST
+    value: 'https://dbc-5dc5c12d-0613.cloud.databricks.com'
   - name: DATABRICKS_WAREHOUSE_ID
     valueFrom: sql-warehouse
   - name: DATABRICKS_GENIE_SPACE_ID
@@ -8,3 +10,13 @@ env:
     valueFrom: postgres
   - name: SERVING_ENDPOINT
     value: 'databricks-gpt-5-4-mini'
+  - name: READINESS_SOURCE_CATALOG
+    value: 'databricks_virtue_foundation_dataset_dais_2026'
+  - name: READINESS_SOURCE_SCHEMA
+    value: 'virtue_foundation_dataset'
+  - name: READINESS_MAX_TABLES
+    value: '50'
+  - name: READINESS_MAX_ROWS_PER_TABLE
+    value: '1000'
+  - name: READINESS_MAX_INDICATOR_ISSUES
+    value: '2000'
