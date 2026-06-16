@@ -206,6 +206,17 @@ const ReviewBody = z.object({
   notes: z.string().trim().optional(),
 });
 
+const BulkReviewBody = z.object({
+  fieldName: z.enum(FIELD_NAMES),
+  anomalyType: z.string().min(1),
+  suggestedValue: z.string().nullable(),
+  decision: z.enum(REVIEW_DECISIONS),
+  correctedValue: z.string().trim().optional(),
+  notes: z.string().trim().optional(),
+  matchSuggestedValue: z.boolean().default(true),
+  limit: z.number().int().min(1).max(1000).default(250),
+});
+
 const AssistBody = z.object({
   recordId: z.string().uuid(),
   instruction: z.string().trim().min(1).max(2000),
@@ -918,6 +929,39 @@ function anomalyBase(
   };
 }
 
+function normalizePhoneCandidate(value: string): string | null {
+  const digits = value.replace(/\D/g, "");
+  if (digits.length === 10) return `+91${digits}`;
+  if (digits.length >= 11 && digits.length <= 15) return `+${digits}`;
+  return null;
+}
+
+function phoneCandidates(value: string): string[] {
+  let rawCandidates: string[] = [];
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (Array.isArray(parsed)) {
+      rawCandidates = parsed
+        .filter((item): item is string | number => typeof item === "string" || typeof item === "number")
+        .map((item) => String(item));
+    }
+  } catch {
+    rawCandidates = [];
+  }
+
+  if (rawCandidates.length === 0) {
+    rawCandidates = value.match(/\+?\d[\d\s().-]{7,}\d/g) ?? [value];
+  }
+
+  return Array.from(
+    new Set(
+      rawCandidates
+        .map(normalizePhoneCandidate)
+        .filter((candidate): candidate is string => candidate !== null),
+    ),
+  );
+}
+
 function analyzeRow(
   table: SourceTable,
   mapping: ColumnMapping,
@@ -926,10 +970,11 @@ function analyzeRow(
   const anomalies: SourceAnomaly[] = [];
   const zip = rowValue(row, mapping.zip);
   if (mapping.zip && zip && !/^\d{6}$/.test(zip)) {
-    const extracted = zip.match(/\d{6}/)?.[0] ?? null;
+    const digitsOnly = zip.replace(/\D/g, "");
+    const extracted = zip.match(/\d{6}/)?.[0] ?? (digitsOnly.length === 6 ? digitsOnly : null);
     anomalies.push({
       ...anomalyBase(table, mapping, row, "zip", mapping.zip, zip),
-      anomaly_type: extracted ? "embedded_pincode_text" : "invalid_pincode",
+      anomaly_type: "invalid_pincode",
       suggested_value: extracted,
       suggestion_method: extracted ? "regex" : "none",
       suggestion_explanation: extracted
@@ -967,19 +1012,18 @@ function analyzeRow(
 
   const phone = rowValue(row, mapping.phone);
   if (mapping.phone && phone) {
-    const digits = phone.replace(/\D/g, "");
-    const hasPhoneShape = digits.length >= 8 && digits.length <= 15;
-    const cleanPhone = digits.length === 10 ? `+91${digits}` : `+${digits}`;
-    if (!/^\+?\d[\d\s-]{7,}$/.test(phone) || phone !== cleanPhone) {
+    const candidates = phoneCandidates(phone);
+    const primaryPhone = candidates[0] ?? null;
+    if (primaryPhone === null || phone.trim() !== primaryPhone || candidates.length > 1) {
       anomalies.push({
         ...anomalyBase(table, mapping, row, "phone", mapping.phone, phone),
-        anomaly_type: hasPhoneShape ? "embedded_phone_text" : "invalid_phone",
-        suggested_value: hasPhoneShape ? cleanPhone : null,
-        suggestion_method: hasPhoneShape ? "regex" : "none",
-        suggestion_explanation: hasPhoneShape
-          ? "Extracted a normalized phone number from a mixed-format value."
+        anomaly_type: "invalid_phone",
+        suggested_value: primaryPhone,
+        suggestion_method: primaryPhone ? "regex" : "none",
+        suggestion_explanation: primaryPhone
+          ? `Extracted primary normalized phone number from ${candidates.length} unique valid candidate${candidates.length === 1 ? "" : "s"}.`
           : "Phone value does not contain a plausible phone number.",
-        validation_state: hasPhoneShape ? "valid" : "invalid",
+        validation_state: primaryPhone ? "valid" : "invalid",
       });
     }
   }
@@ -1248,6 +1292,24 @@ async function runWarehouseDatabaseSync(
         }
       }
     }
+
+    await appkit.lakebase.query(
+      `UPDATE data_readiness.flagged_records old_zip
+       SET status = 'stale',
+           updated_at = NOW(),
+           notes = COALESCE(old_zip.notes, 'Superseded by stable invalid_pincode anomaly identity')
+       WHERE old_zip.field_name = 'zip'
+         AND old_zip.anomaly_type = 'embedded_pincode_text'
+         AND old_zip.status IN ('pending', 'reopened')
+         AND EXISTS (
+           SELECT 1
+           FROM data_readiness.flagged_records stable_zip
+           WHERE stable_zip.field_name = 'zip'
+             AND stable_zip.anomaly_type = 'invalid_pincode'
+             AND stable_zip.source_record_id = old_zip.source_record_id
+             AND stable_zip.source_value_hash = old_zip.source_value_hash
+         )`,
+    );
 
     const completed = await appkit.lakebase.query(
       `UPDATE data_readiness.sync_runs
@@ -1909,6 +1971,70 @@ export async function setupReadinessRoutes(appkit: AppKitWithLakebase) {
       } catch (err) {
         console.error("[readiness] Failed to save review:", err);
         res.status(400).json({ error: "Failed to save review" });
+      }
+    });
+
+    app.post("/api/readiness/review/bulk", async (req, res) => {
+      try {
+        const d = BulkReviewBody.parse(req.body);
+        const reviewer = actorEmail(req);
+        const correctedValue =
+          d.decision === "nullified" ? null : (d.correctedValue ?? null);
+
+        const result = await appkit.lakebase.query(
+          `WITH candidates AS (
+            SELECT id, status, corrected_value
+            FROM data_readiness.flagged_records
+            WHERE field_name = $1
+              AND anomaly_type = $2
+              AND status IN ('pending', 'reopened')
+              AND ($9 = false OR suggested_value IS NOT DISTINCT FROM $3)
+            ORDER BY updated_at DESC
+            LIMIT $8
+          ),
+          updated AS (
+            UPDATE data_readiness.flagged_records target
+            SET status = $4,
+              corrected_value = CASE
+                WHEN $4 = 'nullified' THEN NULL
+                WHEN $5::text IS NOT NULL THEN $5
+                ELSE target.suggested_value
+              END,
+              notes = $6,
+              reviewed_by = $7,
+              reviewed_at = NOW(),
+              updated_at = NOW()
+            FROM candidates
+            WHERE target.id = candidates.id
+            RETURNING target.id, candidates.status AS previous_status,
+              candidates.corrected_value AS previous_value,
+              target.corrected_value AS new_value
+          ),
+          event AS (
+            INSERT INTO data_readiness.review_events (
+              flagged_record_id, event_type, previous_status, new_status,
+              previous_value, new_value, actor_email, event_note
+            )
+            SELECT id, 'reviewed', previous_status, $4, previous_value, new_value, $7, $6
+            FROM updated
+          )
+          SELECT COUNT(*) AS reviewed_count FROM updated`,
+          [
+            d.fieldName,
+            d.anomalyType,
+            d.suggestedValue,
+            d.decision,
+            correctedValue,
+            d.notes ?? `Bulk ${d.decision} for ${d.anomalyType}`,
+            reviewer,
+            d.limit,
+            d.matchSuggestedValue,
+          ],
+        );
+        res.json(result.rows[0]);
+      } catch (err) {
+        console.error("[readiness] Failed to save bulk review:", err);
+        res.status(400).json({ error: "Failed to save bulk review" });
       }
     });
 
